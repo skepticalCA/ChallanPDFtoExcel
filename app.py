@@ -3,6 +3,7 @@ import pandas as pd
 import pdfplumber
 import re
 import io
+import zipfile
 
 # --- App Configuration ---
 st.set_page_config(
@@ -65,6 +66,29 @@ def extract_data_from_pdf(uploaded_file):
                 data[key] = "Error"
     return data
 
+# Helper function to build a new filename from extracted data
+def build_new_filename(data):
+    """
+    Returns a sanitized filename in the format:
+    TAN_NatureOfPayment_Amount_DateOfPayment.pdf
+    Falls back to the original filename if required fields are missing.
+    """
+    tan = data.get("TAN") or ""
+    nature = data.get("Nature of Payment") or ""
+    amount = (data.get("Amount (in Rs.)") or "").replace(",", "")
+    date = data.get("Date of Deposit") or data.get("Tender Date") or ""
+
+    if tan and nature and amount and date:
+        # Sanitize date: "15-Jan-2024" → keep as-is (dashes are fine in filenames)
+        new_name = f"{tan}_{nature}_{amount}_{date}.pdf"
+        # Remove any characters not safe for filenames
+        new_name = re.sub(r'[<>:"/\\|?*]', '_', new_name)
+        return new_name
+
+    # If any required field is missing, fall back to original name
+    return data.get("Filename", "unknown.pdf")
+
+
 # Helper function to convert DataFrame to CSV in memory for download
 @st.cache_data
 def convert_df_to_csv(df):
@@ -106,11 +130,16 @@ uploaded_files = st.file_uploader(
 
 if uploaded_files:
     all_data = []
+    file_bytes_map = {}  # original filename → bytes, for ZIP creation
     # Progress bar for user feedback
     progress_bar = st.progress(0, text="Processing files, please wait...")
 
     for i, uploaded_file in enumerate(uploaded_files):
         with st.spinner(f"Processing: `{uploaded_file.name}`..."):
+            file_bytes = uploaded_file.read()
+            file_bytes_map[uploaded_file.name] = file_bytes
+            # Reset pointer so pdfplumber can read the file
+            uploaded_file.seek(0)
             data = extract_data_from_pdf(uploaded_file)
             all_data.append(data)
         progress_bar.progress((i + 1) / len(uploaded_files), text=f"Processed: {uploaded_file.name}")
@@ -119,26 +148,50 @@ if uploaded_files:
 
     if all_data:
         st.success(f"✅ **Successfully processed {len(all_data)} files!**")
-        
+
+        # Compute suggested new filenames
+        for data in all_data:
+            data["Suggested Filename"] = build_new_filename(data)
+
         # Create a DataFrame from the extracted data
         df = pd.DataFrame(all_data)
 
-        # Reorder columns to have Filename first
-        field_keys = ["Filename"] + list(patterns.keys())
+        # Reorder columns: Filename, Suggested Filename, then all extracted fields
+        field_keys = ["Filename", "Suggested Filename"] + list(patterns.keys())
         df = df[field_keys]
 
         # Display the extracted data in an interactive table
         st.subheader("📊 Extracted Data")
         st.dataframe(df)
 
-        # Provide a download button for the CSV
+        col1, col2 = st.columns(2)
+
+        # CSV download
         csv_data = convert_df_to_csv(df)
-        
-        st.download_button(
-            label="📥 Download Data as CSV",
-            data=csv_data,
-            file_name="extracted_challan_details.csv",
-            mime="text/csv",
-        )
+        with col1:
+            st.download_button(
+                label="📥 Download Data as CSV",
+                data=csv_data,
+                file_name="extracted_challan_details.csv",
+                mime="text/csv",
+            )
+
+        # ZIP download with renamed PDFs
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for data in all_data:
+                original_name = data["Filename"]
+                new_name = data["Suggested Filename"]
+                if original_name in file_bytes_map:
+                    zf.writestr(new_name, file_bytes_map[original_name])
+        zip_buffer.seek(0)
+
+        with col2:
+            st.download_button(
+                label="📦 Download Renamed PDFs as ZIP",
+                data=zip_buffer,
+                file_name="renamed_challans.zip",
+                mime="application/zip",
+            )
 else:
     st.info("Upload PDF files to begin the extraction process.")
